@@ -25,7 +25,7 @@ extern void Cache_Read_Enable_New(uint32_t map, uint32_t base, uint32_t val);
 
 // Restores MMU cache mapping for the currently executing ROM slot
 // when SDK SPI flash functions reset the cache register to 0.
-static void ICACHE_FLASH_ATTR rboot_restore_cache_mapping(void) {
+static void ICACHE_RAM_ATTR rboot_restore_cache_mapping(void) {
 	uint8_t current_rom;
 	uint32_t flash_addr;
 	
