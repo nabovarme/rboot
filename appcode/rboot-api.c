@@ -19,6 +19,26 @@
 extern "C" {
 #endif
 
+// Prototypes for SDK ROM MMU Cache functions
+extern void Cache_Read_Disable(void);
+extern void Cache_Read_Enable_New(uint32_t map, uint32_t base, uint32_t val);
+
+// Restores MMU cache mapping for the currently executing ROM slot
+// when SDK SPI flash functions reset the cache register to 0.
+static void ICACHE_FLASH_ATTR rboot_restore_cache_mapping(void) {
+	uint8_t current_rom;
+	uint32_t flash_addr;
+	
+	current_rom = rboot_get_current_rom();
+	if (current_rom != 0) {
+		rboot_config conf = rboot_get_config();
+		flash_addr = conf.roms[current_rom];
+		// Map 0x40200000 virtual to physical flash_addr in MMU
+		Cache_Read_Disable();
+		Cache_Read_Enable_New(0, 0, flash_addr >> 16);
+	}
+}
+
 #if defined(BOOT_CONFIG_CHKSUM) || defined(BOOT_RTC_ENABLED)
 // calculate checksum for block of data
 // from start up to (but excluding) end
@@ -57,9 +77,13 @@ bool ICACHE_FLASH_ATTR rboot_set_config(rboot_config *conf) {
 	
 	spi_flash_read(BOOT_CONFIG_SECTOR * SECTOR_SIZE, (uint32_t*)((void*)buffer), SECTOR_SIZE);
 	memcpy(buffer, conf, sizeof(rboot_config));
-	spi_flash_erase_sector(BOOT_CONFIG_SECTOR);
-	spi_flash_write(BOOT_CONFIG_SECTOR * SECTOR_SIZE, (uint32_t*)((void*)buffer), SECTOR_SIZE);
 	
+	spi_flash_erase_sector(BOOT_CONFIG_SECTOR);
+	rboot_restore_cache_mapping();
+
+	spi_flash_write(BOOT_CONFIG_SECTOR * SECTOR_SIZE, (uint32_t*)((void*)buffer), SECTOR_SIZE);
+	rboot_restore_cache_mapping();
+
 	os_free(buffer);
 	return true;
 }
@@ -136,23 +160,20 @@ bool ICACHE_FLASH_ATTR rboot_write_flash(rboot_write_status *status, uint8_t *da
 	len -= status->extra_count;
 	memcpy(status->extra_bytes, buffer + len, status->extra_count);
 
-	// check data will fit
-	//if (status->start_addr + len < (status->start_sector + status->max_sector_count) * SECTOR_SIZE) {
+	// erase any additional sectors needed by this chunk
+	lastsect = ((status->start_addr + len) - 1) / SECTOR_SIZE;
+	while (lastsect > status->last_sector_erased) {
+		status->last_sector_erased++;
+		spi_flash_erase_sector(status->last_sector_erased);
+		rboot_restore_cache_mapping();
+	}
 
-		// erase any additional sectors needed by this chunk
-		lastsect = ((status->start_addr + len) - 1) / SECTOR_SIZE;
-		while (lastsect > status->last_sector_erased) {
-			status->last_sector_erased++;
-			spi_flash_erase_sector(status->last_sector_erased);
-		}
-
-		// write current chunk
-		//os_printf("write addr: 0x%08x, len: 0x%04x\r\n", status->start_addr, len);
-		if (spi_flash_write(status->start_addr, (uint32_t *)((void*)buffer), len) == SPI_FLASH_RESULT_OK) {
-			ret = true;
-			status->start_addr += len;
-		}
-	//}
+	// write current chunk
+	if (spi_flash_write(status->start_addr, (uint32_t *)((void*)buffer), len) == SPI_FLASH_RESULT_OK) {
+		ret = true;
+		status->start_addr += len;
+	}
+	rboot_restore_cache_mapping();
 
 	os_free(buffer);
 	return ret;
