@@ -84,13 +84,19 @@ rboot_config ICACHE_FLASH_ATTR rboot_get_config(void) {
 	// SDK 3.0 spi_flash_read requires 4-byte multiples. 
 	// sizeof(rboot_config) is 25, so we read into an aligned 128-byte array.
 	uint32_t buffer[32]; 
+	uint8_t actual_rom;
 	
 	spi_flash_read(BOOT_CONFIG_SECTOR * SECTOR_SIZE, buffer, sizeof(buffer));
 	// os_memcpy safely handles unaligned struct mappings
 	os_memcpy(&conf, buffer, sizeof(rboot_config)); 
-	
-	// Cache the active ROM address so the IRAM wrappers know where to map
-	rboot_active_rom_addr = conf.roms[conf.current_rom];
+
+	// Check RTC memory first to see which ROM slot is ACTUALLY running
+	if (!rboot_get_last_boot_rom(&actual_rom)) {
+		actual_rom = conf.current_rom;
+	}
+
+	// Cache the physical flash address of the EXECUTING slot for the IRAM wrapper
+	rboot_active_rom_addr = conf.roms[actual_rom];
 	
 	return conf;
 }
@@ -101,13 +107,18 @@ rboot_config ICACHE_FLASH_ATTR rboot_get_config(void) {
 // updates checksum automatically (if enabled)
 bool ICACHE_FLASH_ATTR rboot_set_config(rboot_config *conf) {
 	uint8_t *buffer;
+	uint8_t actual_rom;
+
 	buffer = (uint8_t*)os_malloc(SECTOR_SIZE);
 	if (!buffer) {
 		return false;
 	}
 
-	// Update the active ROM address tracker for IRAM wrappers
-	rboot_active_rom_addr = conf->roms[conf->current_rom];
+	// Determine actual running ROM so cache restoration maps correctly
+	if (!rboot_get_last_boot_rom(&actual_rom)) {
+		actual_rom = conf->current_rom;
+	}
+	rboot_active_rom_addr = conf->roms[actual_rom];
 
 #ifdef BOOT_CONFIG_CHKSUM
 	conf->chksum = calc_chksum((uint8_t*)conf, (uint8_t*)&conf->chksum);
