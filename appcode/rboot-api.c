@@ -19,52 +19,6 @@
 extern "C" {
 #endif
 
-// Prototypes for ESP8266 hardware ROM functions (Bypassing SDK Flash wrappers)
-extern int SPIEraseSector(uint16_t);
-extern int SPIWrite(uint32_t, const void*, uint32_t);
-extern void Cache_Read_Disable(void);
-extern void Cache_Read_Enable_New(uint32_t map, uint32_t base, uint32_t val);
-
-// Force compiler to put these wrappers in Instruction RAM, untouched by flash cache
-#define RBOOT_IRAM_ATTR __attribute__((section(".iram.text")))
-
-// Global tracker for the active ROM offset
-static uint32_t rboot_active_rom_addr = 0;
-
-// =========================================================================
-// IRAM WRAPPERS 
-// These execute from Instruction RAM, surviving the cache wipe.
-// =========================================================================
-
-static void RBOOT_IRAM_ATTR rboot_restore_cache_iram(void) {
-	if (rboot_active_rom_addr != 0) {
-		Cache_Read_Disable();
-		Cache_Read_Enable_New(0, 0, rboot_active_rom_addr >> 16);
-	}
-}
-
-static bool RBOOT_IRAM_ATTR rboot_safe_erase(uint16_t sector) {
-	int ret;
-	ETS_INTR_LOCK(); // Must lock interrupts when using raw ROM functions
-	ret = SPIEraseSector(sector);
-	rboot_restore_cache_iram();
-	ETS_INTR_UNLOCK();
-	return (ret == 0);
-}
-
-static bool RBOOT_IRAM_ATTR rboot_safe_write(uint32_t addr, uint32_t *buf, uint32_t len) {
-	int ret;
-	ETS_INTR_LOCK(); // Must lock interrupts when using raw ROM functions
-	ret = SPIWrite(addr, buf, len);
-	rboot_restore_cache_iram();
-	ETS_INTR_UNLOCK();
-	return (ret == 0);
-}
-
-// =========================================================================
-// STANDARD FLASH FUNCTIONS
-// =========================================================================
-
 #if defined(BOOT_CONFIG_CHKSUM) || defined(BOOT_RTC_ENABLED)
 // calculate checksum for block of data
 // from start up to (but excluding) end
@@ -81,23 +35,7 @@ static uint8_t calc_chksum(uint8_t *start, uint8_t *end) {
 // get the rboot config
 rboot_config ICACHE_FLASH_ATTR rboot_get_config(void) {
 	rboot_config conf;
-	// SDK 3.0 spi_flash_read requires 4-byte multiples. 
-	// sizeof(rboot_config) is 25, so we read into an aligned 128-byte array.
-	uint32_t buffer[32]; 
-	uint8_t actual_rom;
-	
-	spi_flash_read(BOOT_CONFIG_SECTOR * SECTOR_SIZE, buffer, sizeof(buffer));
-	// os_memcpy safely handles unaligned struct mappings
-	os_memcpy(&conf, buffer, sizeof(rboot_config)); 
-
-	// Check RTC memory first to see which ROM slot is ACTUALLY running
-	if (!rboot_get_last_boot_rom(&actual_rom)) {
-		actual_rom = conf.current_rom;
-	}
-
-	// Cache the physical flash address of the EXECUTING slot for the IRAM wrapper
-	rboot_active_rom_addr = conf.roms[actual_rom];
-	
+	spi_flash_read(BOOT_CONFIG_SECTOR * SECTOR_SIZE, (uint32_t*)&conf, sizeof(rboot_config));
 	return conf;
 }
 
@@ -107,30 +45,20 @@ rboot_config ICACHE_FLASH_ATTR rboot_get_config(void) {
 // updates checksum automatically (if enabled)
 bool ICACHE_FLASH_ATTR rboot_set_config(rboot_config *conf) {
 	uint8_t *buffer;
-	uint8_t actual_rom;
-
 	buffer = (uint8_t*)os_malloc(SECTOR_SIZE);
 	if (!buffer) {
+		//os_printf("No ram!\r\n");
 		return false;
 	}
-
-	// Determine actual running ROM so cache restoration maps correctly
-	if (!rboot_get_last_boot_rom(&actual_rom)) {
-		actual_rom = conf->current_rom;
-	}
-	rboot_active_rom_addr = conf->roms[actual_rom];
 
 #ifdef BOOT_CONFIG_CHKSUM
 	conf->chksum = calc_chksum((uint8_t*)conf, (uint8_t*)&conf->chksum);
 #endif
 	
 	spi_flash_read(BOOT_CONFIG_SECTOR * SECTOR_SIZE, (uint32_t*)((void*)buffer), SECTOR_SIZE);
-	// os_memcpy safely handles unaligned struct mappings
-	os_memcpy(buffer, conf, sizeof(rboot_config));
-	
-	// Use IRAM wrappers to prevent cache wipe crashes
-	rboot_safe_erase(BOOT_CONFIG_SECTOR);
-	rboot_safe_write(BOOT_CONFIG_SECTOR * SECTOR_SIZE, (uint32_t*)((void*)buffer), SECTOR_SIZE);
+	memcpy(buffer, conf, sizeof(rboot_config));
+	spi_flash_erase_sector(BOOT_CONFIG_SECTOR);
+	spi_flash_write(BOOT_CONFIG_SECTOR * SECTOR_SIZE, (uint32_t*)((void*)buffer), SECTOR_SIZE);
 	
 	os_free(buffer);
 	return true;
@@ -155,12 +83,11 @@ bool ICACHE_FLASH_ATTR rboot_set_current_rom(uint8_t rom) {
 // create the write status struct, based on supplied start address
 rboot_write_status ICACHE_FLASH_ATTR rboot_write_init(uint32_t start_addr) {
 	rboot_write_status status = {0};
-	// Ensure active ROM is loaded before flashing begins
-	rboot_get_config(); 
-	
 	status.start_addr = start_addr;
 	status.start_sector = start_addr / SECTOR_SIZE;
 	status.last_sector_erased = status.start_sector - 1;
+	//status.max_sector_count = 200;
+	//os_printf("init addr: 0x%08x\r\n", start_addr);
 	return status;
 }
 
@@ -191,40 +118,41 @@ bool ICACHE_FLASH_ATTR rboot_write_flash(rboot_write_status *status, uint8_t *da
 	// get a buffer
 	buffer = (uint8_t *)os_malloc(len + status->extra_count);
 	if (!buffer) {
+		//os_printf("No ram!\r\n");
 		return false;
 	}
 
-	// copy in any remaining bytes from last chunk (os_memcpy is unaligned-safe)
+	// copy in any remaining bytes from last chunk
 	if (status->extra_count != 0) {
-		os_memcpy(buffer, status->extra_bytes, status->extra_count);
+		memcpy(buffer, status->extra_bytes, status->extra_count);
 	}
-	// copy in new data (os_memcpy is unaligned-safe)
-	os_memcpy(buffer + status->extra_count, data, len);
+	// copy in new data
+	memcpy(buffer + status->extra_count, data, len);
 
 	// calculate length, must be multiple of 4
 	// save any remaining bytes for next go
 	len += status->extra_count;
 	status->extra_count = len % 4;
 	len -= status->extra_count;
-	os_memcpy(status->extra_bytes, buffer + len, status->extra_count);
+	memcpy(status->extra_bytes, buffer + len, status->extra_count);
 
-	// erase any additional sectors needed by this chunk
-	lastsect = ((status->start_addr + len) - 1) / SECTOR_SIZE;
-	while (lastsect > status->last_sector_erased) {
-		status->last_sector_erased++;
-		// Use IRAM ROM Wrapper
-		if (!rboot_safe_erase(status->last_sector_erased)) {
-			os_free(buffer);
-			return false;
+	// check data will fit
+	//if (status->start_addr + len < (status->start_sector + status->max_sector_count) * SECTOR_SIZE) {
+
+		// erase any additional sectors needed by this chunk
+		lastsect = ((status->start_addr + len) - 1) / SECTOR_SIZE;
+		while (lastsect > status->last_sector_erased) {
+			status->last_sector_erased++;
+			spi_flash_erase_sector(status->last_sector_erased);
 		}
-	}
 
-	// write current chunk - Use IRAM ROM Wrapper
-	// buffer is guaranteed 32-bit aligned because it came from os_malloc
-	if (rboot_safe_write(status->start_addr, (uint32_t *)((void*)buffer), len)) {
-		ret = true;
-		status->start_addr += len;
-	}
+		// write current chunk
+		//os_printf("write addr: 0x%08x, len: 0x%04x\r\n", status->start_addr, len);
+		if (spi_flash_write(status->start_addr, (uint32_t *)((void*)buffer), len) == SPI_FLASH_RESULT_OK) {
+			ret = true;
+			status->start_addr += len;
+		}
+	//}
 
 	os_free(buffer);
 	return ret;
